@@ -4,7 +4,7 @@ import gc
 import math
 import tempfile
 import subprocess
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Response
 
 os.environ["MALLOC_ARENA_MAX"] = "2"
 
@@ -17,6 +17,24 @@ DENSITIES = {
     "ABS": 1.04,
     "TPU": 1.21
 }
+
+BASE_CONFIG = """
+layer_height = 0.28
+first_layer_height = 0.28
+nozzle_diameter = 0.4
+filament_diameter = 1.75
+threads = 1
+fill_pattern = rectilinear
+solid_fill_pattern = rectilinear
+top_solid_layers = 3
+bottom_solid_layers = 3
+gap_fill_enabled = 1
+gap_fill_speed = 40
+infill_overlap = 25%
+bridge_flow_ratio = 1
+cooling = 0
+disable_fan_first_layers = 1
+"""
 
 def parse_gcode_stats(gcode_path: str, material: str):
     weight_g = 0.0
@@ -41,7 +59,7 @@ def parse_gcode_stats(gcode_path: str, material: str):
                 if m_mm:
                     length_mm = float(m_mm.group(1))
                 elif m_m:
-                    length_mm = float(m_m.group(1)) * 1000.0
+                    length_mm = float(m_mm.group(1)) * 1000.0
 
                 if length_mm > 0:
                     volume_cm3 = (math.pi * (0.875 ** 2) * length_mm) / 1000.0
@@ -60,7 +78,8 @@ def parse_gcode_stats(gcode_path: str, material: str):
 
     return round(weight_g, 1), round(time_seconds / 3600.0, 2)
 
-@app.get("/")
+# РАЗРЕШАЕМ И GET, И HEAD — ТЕПЕРЬ RENDER НЕ БУДЕТ УБИВАТЬ СЕРВЕР
+@app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok", "message": "3D Slicer Server is running"}
 
@@ -77,28 +96,14 @@ async def slice_stl(
         output_gcode = os.path.join(tmpdir, "model.gcode")
         config_ini = os.path.join(tmpdir, "config.ini")
 
+        valid_infill = max(0, min(100, infill))
+        valid_perimeters = max(1, min(20, perimeters))
+
         with open(config_ini, "w") as cfg:
-            cfg.write(
-                "layer_height = 0.32\n"
-                "first_layer_height = 0.32\n"
-                "nozzle_diameter = 0.4\n"
-                "filament_diameter = 1.75\n"
-                "threads = 1\n"
-                "fill_pattern = rectilinear\n"
-                "solid_fill_pattern = rectilinear\n"
-                "top_solid_layers = 2\n"
-                "bottom_solid_layers = 2\n"
-                "support_material = 0\n"
-                "gcode_comments = 0\n"
-            )
+            cfg.write(BASE_CONFIG.strip() + "\n")
             if is_vase:
-                cfg.write("spiral_vase = 1\n")
-                cfg.write("perimeters = 1\n")
-                cfg.write("fill_density = 0%\n")
-                cfg.write("top_solid_layers = 0\n")
+                cfg.write("spiral_vase = 1\nperimeters = 1\nfill_density = 0%\ntop_solid_layers = 0\n")
             else:
-                valid_infill = max(0, min(100, infill))
-                valid_perimeters = max(1, min(10, perimeters))
                 cfg.write(f"perimeters = {valid_perimeters}\n")
                 cfg.write(f"fill_density = {valid_infill}%\n")
 
@@ -117,10 +122,9 @@ async def slice_stl(
         ]
 
         try:
-            # Увеличили таймаут до 300 секунд (5 минут)
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
         except subprocess.TimeoutExpired:
-            return {"status": "error", "message": "Превышено время ожидания нарезки"}
+            return {"status": "error", "message": "Превышено время ожидания"}
 
         if not os.path.exists(output_gcode):
             err_log = res.stderr.decode('utf-8', errors='ignore').strip()

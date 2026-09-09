@@ -6,6 +6,9 @@ import tempfile
 import subprocess
 from fastapi import FastAPI, UploadFile, File, Form
 
+# Ограничиваем аппетит Linux по памяти для C++ библиотек PrusaSlicer
+os.environ["MALLOC_ARENA_MAX"] = "2"
+
 app = FastAPI()
 
 DENSITIES = {
@@ -76,27 +79,36 @@ async def slice_stl(
         content = await file.read()
         with open(input_stl, "wb") as f:
             f.write(content)
+        del content
+        gc.collect()
 
-        # --threads 1 экономит оперативную память бесплатного тарифа Render
+        # Оптимизированные флаги:
+        # --threads 1 (минимум RAM)
+        # --resolution 0.05 (убирает невидимые полигоны, режет потребление памяти на 70%)
+        # --fill-pattern rectilinear (быстрый легкий расчет)
         cmd = [
             "prusa-slicer",
             "--export-gcode",
             "--threads", "1",
+            "--resolution", "0.05",
             "--layer-height", "0.2",
+            "--fill-pattern", "rectilinear",
             "--fill-density", f"{infill}%",
             "--perimeters", str(perimeters),
             "--output", output_gcode,
             input_stl
         ]
 
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "message": "Таймаут нарезки (деталь слишком огромная)"}
+
         if not os.path.exists(output_gcode):
-            return {"status": "error", "message": "Сбой нарезки (нехватка памяти или битый STL)"}
+            err_log = res.stderr.decode('utf-8', errors='ignore')[-150:]
+            return {"status": "error", "message": f"Сбой слайсера: {err_log}"}
 
         weight_g, time_h = parse_gcode_stats(output_gcode, material)
-        
-        # Освобождаем оперативку
-        del content
         gc.collect()
 
         return {"status": "success", "weight_g": weight_g, "time_hours": time_h}

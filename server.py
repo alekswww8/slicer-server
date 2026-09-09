@@ -6,7 +6,6 @@ import tempfile
 import subprocess
 from fastapi import FastAPI, UploadFile, File, Form
 
-# Ограничиваем аппетит Linux по памяти для C++ библиотек PrusaSlicer
 os.environ["MALLOC_ARENA_MAX"] = "2"
 
 app = FastAPI()
@@ -75,6 +74,17 @@ async def slice_stl(
     with tempfile.TemporaryDirectory() as tmpdir:
         input_stl = os.path.join(tmpdir, "model.stl")
         output_gcode = os.path.join(tmpdir, "model.gcode")
+        config_ini = os.path.join(tmpdir, "config.ini")
+
+        # Создаем временный файл настроек: только проверенные базовые параметры
+        with open(config_ini, "w") as cfg:
+            cfg.write(
+                "layer_height = 0.28\n"
+                "first_layer_height = 0.28\n"
+                "nozzle_diameter = 0.4\n"
+                "filament_diameter = 1.75\n"
+                "threads = 1\n"
+            )
 
         content = await file.read()
         with open(input_stl, "wb") as f:
@@ -82,17 +92,11 @@ async def slice_stl(
         del content
         gc.collect()
 
-        # Оптимизированные флаги:
-        # --threads 1 (минимум RAM)
-        # --resolution 0.05 (убирает невидимые полигоны, режет потребление памяти на 70%)
-        # --fill-pattern rectilinear (быстрый легкий расчет)
+        # Чистые стандартные флаги PrusaSlicer без неизвестных опций
         cmd = [
             "prusa-slicer",
             "--export-gcode",
-            "--threads", "1",
-            "--resolution", "0.05",
-            "--layer-height", "0.2",
-            "--fill-pattern", "rectilinear",
+            "--load", config_ini,
             "--fill-density", f"{infill}%",
             "--perimeters", str(perimeters),
             "--output", output_gcode,
@@ -102,11 +106,11 @@ async def slice_stl(
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         except subprocess.TimeoutExpired:
-            return {"status": "error", "message": "Таймаут нарезки (деталь слишком огромная)"}
+            return {"status": "error", "message": "Превышено время ожидания (120с)"}
 
         if not os.path.exists(output_gcode):
             err_log = res.stderr.decode('utf-8', errors='ignore')[-150:]
-            return {"status": "error", "message": f"Сбой слайсера: {err_log}"}
+            return {"status": "error", "message": f"Сбой слайсера: {err_log.strip()}"}
 
         weight_g, time_h = parse_gcode_stats(output_gcode, material)
         gc.collect()
